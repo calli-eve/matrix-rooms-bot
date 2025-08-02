@@ -1,6 +1,5 @@
 import { readFile, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
-import path from 'path';
 
 export class RoomMonitor {
     constructor(matrixClient, config) {
@@ -10,181 +9,86 @@ export class RoomMonitor {
         this.notificationRoom = config.roomMonitor?.notificationRoom;
         this.stateFile = config.roomMonitor?.stateFile || './data/room-monitor-state.json';
         this.lastCheckedRooms = new Set();
+        this.roomNames = {};
         this.isRunning = false;
     }
 
     async fetchRoomsInSpace(spaceId, visitedSpaces = new Set()) {
-        try {
-            // Prevent infinite recursion
-            if (visitedSpaces.has(spaceId)) {
-                console.log(`Already visited space ${spaceId}, skipping`);
-                return [];
-            }
+        const allRooms = [];
+    
+        const recurseHierarchy = async (spaceId) => {
+            if (visitedSpaces.has(spaceId)) return;
             visitedSpaces.add(spaceId);
-
-            // Try to get room data directly from the server
-            const response = await this.matrixClient.http.authedRequest(
-                'GET',
-                `/rooms/${encodeURIComponent(spaceId)}/state`
-            );
-            
-            if (!response) {
-                console.error(`Space ${spaceId} not found or not accessible. Make sure the bot is a member of this space.`);
-                return [];
-            }
-
-            const rooms = [];
-            const subspaces = [];
-
-            // Look for m.space.child events in the state
-            for (const event of response) {
-                if (event.type === 'm.space.child') {
-                    const roomId = event.state_key;
-                    const roomName = event.content?.name || roomId;
-                    
-                    // Check if this is a space (has space type) or a regular room
-                    if (event.content?.room_type === 'm.space') {
-                        subspaces.push({
-                            room_id: roomId,
-                            name: roomName
-                        });
+    
+            let nextBatch = null;
+            do {
+                let query = `/rooms/${encodeURIComponent(spaceId)}/hierarchy?limit=100`;
+                if (nextBatch) query += `&from=${encodeURIComponent(nextBatch)}`;
+    
+                const response = await this.matrixClient.http.authedRequest(
+                    'GET',
+                    query,
+                    undefined,
+                    undefined,
+                    {
+                        prefix: '/_matrix/client/v1'  // ✅ Correct path
+                    }
+                );
+    
+                const rooms = response.rooms || [];
+    
+                for (const room of rooms) {
+                    const isSpace = room.room_type === 'm.space';
+                    const metadata = {
+                        room_id: room.room_id,
+                        name: room.name || null,
+                        canonicalAlias: room.canonical_alias || null,
+                        topic: room.topic || '',  // ✅ Pull description
+                        memberCount: room.num_joined_members || 0
+                    };
+    
+                    if (isSpace) {
+                        await recurseHierarchy(room.room_id);
                     } else {
-                        rooms.push({
-                            room_id: roomId,
-                            name: roomName
-                        });
+                        allRooms.push(metadata);
                     }
                 }
-            }
-
-            console.log(`Found ${rooms.length} rooms and ${subspaces.length} subspaces in space ${spaceId}`);
-
-            // Recursively fetch rooms from subspaces
-            for (const subspace of subspaces) {
-                try {
-                    console.log(`Checking subspace: ${subspace.name} (${subspace.room_id})`);
-                    const subspaceRooms = await this.fetchRoomsInSpace(subspace.room_id, visitedSpaces);
-                    rooms.push(...subspaceRooms);
-                } catch (error) {
-                    console.error(`Error fetching rooms from subspace ${subspace.room_id}:`, error);
-                }
-            }
-
-            return rooms;
+    
+                nextBatch = response.next_batch;
+            } while (nextBatch);
+        };
+    
+        try {
+            await recurseHierarchy(spaceId);
         } catch (error) {
-            console.error('Error fetching rooms in space:', error);
-            return [];
+            console.error(`Error traversing space hierarchy: ${error.message}`);
         }
+    
+        return allRooms;
     }
 
-    async getRoomInfo(roomId) {
+    async sendEnhancedRoomNotification(room) {
         try {
-            // Get room state directly from the server
-            const response = await this.matrixClient.http.authedRequest(
-                'GET',
-                `/rooms/${encodeURIComponent(roomId)}/state`
-            );
-            
-            if (!response) {
-                return null;
-            }
+            const roomId = room.room_id;
+            const roomName = room.name || room.canonicalAlias || roomId;
+            const roomDescription = room.topic || '';
+            const roomAlias = room.canonicalAlias;
+            const memberCount = room.memberCount || 0;
 
-            // Extract room name, alias, and description from state events
-            let roomName = roomId;
-            let canonicalAlias = null;
-            let roomDescription = '';
-            let memberCount = 0;
-
-            for (const event of response) {
-                if (event.type === 'm.room.name' && event.content?.name) {
-                    roomName = event.content.name;
-                } else if (event.type === 'm.room.canonical_alias' && event.content?.alias) {
-                    canonicalAlias = event.content.alias;
-                } else if (event.type === 'm.room.topic' && event.content?.topic) {
-                    roomDescription = event.content.topic;
-                } else if (event.type === 'm.room.member' && event.content?.membership === 'join') {
-                    memberCount++;
-                }
-            }
-
-            return {
-                room_id: roomId,
-                name: roomName,
-                canonical_alias: canonicalAlias,
-                description: roomDescription,
-                joined_member_count: memberCount
-            };
-        } catch (error) {
-            if (error.errcode === 'M_FORBIDDEN') {
-                console.log(`Bot not in room ${roomId}, skipping`);
-                return null;
-            }
-            console.error(`Error fetching room info for ${roomId}:`, error);
-            return null;
-        }
-    }
-
-    async sendRoomNotification(roomInfo) {
-        try {
-            const roomName = roomInfo.name || roomInfo.canonical_alias || roomInfo.room_id;
-            const roomId = roomInfo.room_id;
-            const roomAlias = roomInfo.canonical_alias;
-            const memberCount = roomInfo.joined_member_count || 0;
-            
-            // Create the room link
             const roomLink = roomAlias ? `https://matrix.to/#/${roomAlias}` : `https://matrix.to/#/${roomId}`;
-            
-            // Create the notification message
-            const message = {
-                msgtype: 'm.text',
-                body: `🆕 New room created: **${roomName}**\n👥 Members: ${memberCount}\n🔗 ${roomLink}`,
-                format: 'org.matrix.custom.html',
-                formatted_body: `<p>🆕 <strong>New room created:</strong> <strong>${roomName}</strong></p><p>👥 <strong>Members:</strong> ${memberCount}</p><p>🔗 <a href="${roomLink}">${roomLink}</a></p>`
-            };
 
-            await this.matrixClient.sendEvent(this.notificationRoom, 'm.room.message', message);
-            console.log(`Notification sent for new room: ${roomName} (${roomId})`);
-        } catch (error) {
-            console.error('Error sending room notification:', error);
-        }
-    }
-
-    async sendSimpleRoomNotification(roomId) {
-        try {
-            // Try to get room details if possible
-            let roomName = roomId;
-            let roomDescription = '';
-            let roomAlias = null;
-
-            try {
-                const roomDetails = await this.getRoomInfo(roomId);
-                if (roomDetails) {
-                    roomName = roomDetails.name || roomId;
-                    roomAlias = roomDetails.canonical_alias;
-                    roomDescription = roomDetails.description || '';
-                }
-            } catch (error) {
-                console.log(`Could not fetch details for room ${roomId}, using basic info`);
-            }
-
-            // Create the room link
-            const roomLink = roomAlias ? `https://matrix.to/#/${roomAlias}` : `https://matrix.to/#/${roomId}`;
-            
-            // Create the notification message
             let body = `🆕 New room created in monitored space!\n\n`;
-            body += `**Room Name:** ${roomName}\n`;
-            if (roomDescription) {
-                body += `**Description:** ${roomDescription}\n`;
-            }
+            if (roomName !== roomId) body += `**Room Name:** ${roomName}\n`;
+            if (roomDescription) body += `**Description:** ${roomDescription}\n`;
             body += `**Room ID:** ${roomId}\n`;
+            body += `👥 Members: ${memberCount}\n`;
             body += `🔗 ${roomLink}`;
 
             let formattedBody = `<p>🆕 <strong>New room created in monitored space!</strong></p>`;
-            formattedBody += `<p><strong>Room Name:</strong> ${roomName}</p>`;
-            if (roomDescription) {
-                formattedBody += `<p><strong>Description:</strong> ${roomDescription}</p>`;
-            }
+            if (roomName !== roomId) formattedBody += `<p><strong>Room Name:</strong> ${roomName}</p>`;
+            if (roomDescription) formattedBody += `<p><strong>Description:</strong> ${roomDescription}</p>`;
             formattedBody += `<p><strong>Room ID:</strong> ${roomId}</p>`;
+            formattedBody += `<p><strong>👥 Members:</strong> ${memberCount}</p>`;
             formattedBody += `<p>🔗 <a href="${roomLink}">${roomLink}</a></p>`;
 
             const message = {
@@ -194,65 +98,43 @@ export class RoomMonitor {
                 formatted_body: formattedBody
             };
 
+            console.log(`Sending notification for room ${roomId}`);
             await this.matrixClient.sendEvent(this.notificationRoom, 'm.room.message', message);
-            console.log(`Enhanced notification sent for new room: ${roomName} (${roomId})`);
         } catch (error) {
-            console.error('Error sending enhanced room notification:', error);
+            console.error('Error sending notification:', error);
         }
     }
 
     async checkForNewRooms(shouldAlert = true) {
         if (!this.observedSpace || !this.notificationRoom) {
-            console.log('Room monitoring not configured - skipping check');
+            console.log('Room monitoring not configured');
             return;
         }
 
         try {
-            console.log('Checking for new rooms in space (including subspaces):', this.observedSpace);
-            
             const rooms = await this.fetchRoomsInSpace(this.observedSpace);
-            console.log(`Total rooms found (including subspaces): ${rooms.length}`);
-            
             const currentRoomIds = new Set(rooms.map(room => room.room_id));
-            
-            // Find new rooms (rooms that weren't in our last check)
-            const newRoomIds = [];
-            for (const roomId of currentRoomIds) {
-                if (!this.lastCheckedRooms.has(roomId)) {
-                    newRoomIds.push(roomId);
+            const newRooms = rooms.filter(room => !this.lastCheckedRooms.has(room.room_id));
+
+            for (const room of newRooms) {
+                if (room.name && room.name !== room.room_id) {
+                    this.roomNames[room.room_id] = room.name;
                 }
             }
 
-            // Send notifications for new rooms only if we should alert
-            if (shouldAlert) {
-                for (const roomId of newRoomIds) {
-                    await this.sendSimpleRoomNotification(roomId);
-                    // Small delay between notifications
+            if (shouldAlert && newRooms.length > 0) {
+                for (const room of newRooms) {
+                    await this.sendEnhancedRoomNotification(room);
                     await new Promise(resolve => setTimeout(resolve, 500));
                 }
-            } else {
-                console.log('First run - not sending alerts for existing rooms');
             }
 
-            // Update our set of known rooms
             this.lastCheckedRooms = currentRoomIds;
-
-            // Save state to file
             await this.saveState();
-
-            if (newRoomIds.length > 0) {
-                if (shouldAlert) {
-                    console.log(`Found ${newRoomIds.length} new room(s) in space and subspaces`);
-                } else {
-                    console.log(`Found ${newRoomIds.length} existing room(s) on first run`);
-                }
-            } else {
-                console.log('No new rooms found');
-            }
 
             return {
                 checked: currentRoomIds.size,
-                new: newRoomIds.length,
+                new: newRooms.length,
                 timestamp: new Date()
             };
         } catch (error) {
@@ -272,12 +154,11 @@ export class RoomMonitor {
                 const stateData = await readFile(this.stateFile, 'utf-8');
                 const state = JSON.parse(stateData);
                 this.lastCheckedRooms = new Set(state.rooms || []);
-                console.log(`Loaded state from ${this.stateFile}: ${this.lastCheckedRooms.size} known rooms`);
+                this.roomNames = state.roomNames || {};
+                console.log(`Loaded state from ${this.stateFile}`);
                 return true;
-            } else {
-                console.log(`No state file found at ${this.stateFile}, starting fresh`);
-                return false;
             }
+            return false;
         } catch (error) {
             console.error('Error loading state:', error);
             return false;
@@ -288,45 +169,35 @@ export class RoomMonitor {
         try {
             const state = {
                 rooms: Array.from(this.lastCheckedRooms),
+                roomNames: this.roomNames,
                 lastUpdated: new Date().toISOString(),
                 observedSpace: this.observedSpace
             };
             await writeFile(this.stateFile, JSON.stringify(state, null, 2));
-            console.log(`State saved to ${this.stateFile}`);
+            console.log(`Saved state to ${this.stateFile}`);
         } catch (error) {
             console.error('Error saving state:', error);
         }
     }
 
     async startMonitoring() {
-        if (this.isRunning) {
-            console.log('Room monitoring is already running');
-            return;
-        }
-
-        if (!this.observedSpace || !this.notificationRoom) {
-            console.log('Room monitoring not configured - skipping start');
-            return;
-        }
+        if (this.isRunning) return;
+        if (!this.observedSpace || !this.notificationRoom) return;
 
         console.log('Starting room monitoring...');
         this.isRunning = true;
 
-        // Load existing state
         const hasExistingState = await this.loadState();
-
-        // Do initial check to populate lastCheckedRooms
         await this.checkForNewRooms(hasExistingState);
 
-        // Set up recurring checks
-        const checkInterval = this.config.roomMonitor?.checkInterval || 300000; // 5 minutes default
+        const interval = this.config.roomMonitor?.checkInterval || 300000;
         this.monitoringInterval = setInterval(async () => {
             if (this.isRunning) {
                 await this.checkForNewRooms(true);
             }
-        }, checkInterval);
+        }, interval);
 
-        console.log(`Room monitoring started - checking every ${checkInterval / 1000} seconds`);
+        console.log(`Room monitoring started (interval: ${interval / 1000}s)`);
     }
 
     stopMonitoring() {
@@ -349,4 +220,4 @@ export class RoomMonitor {
             isRunning: this.isRunning
         };
     }
-} 
+}

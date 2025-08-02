@@ -4,6 +4,7 @@ package-lock.json
 
 # Configuration
 config.json
+room-monitor-state.json
 
 # Data directory
 data/
