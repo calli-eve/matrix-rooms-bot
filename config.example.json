@@ -1,0 +1,13 @@
+{
+  "matrix": {
+    "homeserverUrl": "https://matrix.yourserver.com",
+    "accessToken": "your_matrix_access_token_here",
+    "userId": "@matrix-room-bot:yourserver.com"
+  },
+  "roomMonitor": {
+    "observedSpace": "!mainspace:yourserver.com",
+    "notificationRoom": "!notifications:yourserver.com",
+    "checkInterval": 300000,
+    "stateFile": "./data/room-monitor-state.json"
+  }
+} 
